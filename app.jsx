@@ -24,6 +24,15 @@ function currentYM() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
+// like addMonths, but returns an internal "YYYY-MM" (hyphen) string suitable
+// for further date math (parseYM/monthsBetween), rather than a display string.
+function addMonthsISO(ym, n) {
+  const p = parseYM(ym);
+  const total = p.y * 12 + (p.m - 1) + n;
+  const y = Math.floor(total / 12);
+  const m = (total % 12) + 1;
+  return `${y}-${String(m).padStart(2, "0")}`;
+}
 
 // ---------- finance helpers ----------
 function monthlyPayment(balance, ratePercent, months) {
@@ -706,17 +715,14 @@ function App() {
     return tab;
   }
 
-  function setActualTab(id) {
-    setTabs((ts) => ts.map((t) => ({ ...t, isActual: t.id === id })));
+  function toggleActualTab(id) {
+    setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, isActual: !t.isActual } : t)));
   }
 
   function deleteTab(id) {
     if (tabs.length <= 1) return;
     if (!window.confirm("このタブを削除しますか？入力内容は失われます。")) return;
-    let next = tabs.filter((t) => t.id !== id);
-    if (next.length > 0 && !next.some((t) => t.isActual)) {
-      next = next.map((t, i) => (i === 0 ? { ...t, isActual: true } : t));
-    }
+    const next = tabs.filter((t) => t.id !== id);
     setTabs(next);
     if (activeTabId === id) setActiveTabId(next[0].id);
   }
@@ -833,10 +839,10 @@ function App() {
             <IconBtn icon={Share2} label="共有" variant="solid" onClick={handleShareTab} />
             <IconBtn
               icon={Flag}
-              label={activeTab.isActual ? "実際の借入（設定中）" : "実際の借入として設定"}
+              label={activeTab.isActual ? "実際の借入に含めている" : "実際の借入に含める"}
               variant={activeTab.isActual ? "solid" : "ghost"}
-              onClick={() => setActualTab(activeTab.id)}
-              title="「現在の状況」「返済予定表」ページに表示する借入として、このタブを使います"
+              onClick={() => toggleActualTab(activeTab.id)}
+              title="「現在の状況」「返済予定表」ページに表示する借入として、このタブを使います（複数選択できます）"
             />
             <IconBtn icon={RotateCcw} label="初期化" variant="ghost" onClick={resetActiveTab} />
             <span style={S.saveStatusText}>
@@ -864,11 +870,11 @@ function App() {
       )}
 
       {view === "dashboard" && (
-        <DashboardPage tab={tabs.find((t) => t.isActual) || null} onGoToSimulator={() => setView("simulator")} />
+        <DashboardPage tabs={tabs.filter((t) => t.isActual)} onGoToSimulator={() => setView("simulator")} />
       )}
 
       {view === "schedule" && (
-        <SchedulePage tab={tabs.find((t) => t.isActual) || null} onGoToSimulator={() => setView("simulator")} />
+        <SchedulePage tabs={tabs.filter((t) => t.isActual)} onGoToSimulator={() => setView("simulator")} />
       )}
 
       {toast && <div style={S.toast}>{toast}</div>}
@@ -901,7 +907,7 @@ function NoActualTabNotice({ onGoToSimulator }) {
     <div style={S.card}>
       <SectionLabel icon={Flag} label="実際の借入が設定されていません" />
       <p style={S.hint}>
-        「シミュレーション」ページで、実際の借入内容を入力しているタブを開き、「🏳 実際の借入として設定」を押してください。設定したタブの内容が、このページに反映されます。
+        「シミュレーション」ページで、実際の借入内容を入力しているタブを開き、「🏳 実際の借入に含める」を押してください（複数のタブを選ぶと、このページに合算して反映されます）。
       </p>
       <IconBtn icon={TrendingUp} label="シミュレーションページへ" variant="solid" onClick={onGoToSimulator} />
     </div>
@@ -941,50 +947,121 @@ function getMonthEntry(history, m) {
 }
 
 // ---------- 現在の状況 (current balance / principal / interest breakdown) ----------
-function DashboardPage({ tab, onGoToSimulator }) {
-  if (!tab) return <NoActualTabNotice onGoToSimulator={onGoToSimulator} />;
+// Accepts an array of tabs — when more than one is marked as "実際の借入", their
+// figures are summed into an aggregate view, followed by each loan's own detail.
+function DashboardPage({ tabs, onGoToSimulator }) {
+  if (!tabs || tabs.length === 0) return <NoActualTabNotice onGoToSimulator={onGoToSimulator} />;
 
-  const sim = runActualSimulation(tab);
-  if (!sim) {
+  const nowYM = currentYM();
+  const loans = [];
+  const invalidNames = [];
+  tabs.forEach((tab) => {
+    const sim = runActualSimulation(tab);
+    if (!sim) {
+      invalidNames.push(tab.name);
+      return;
+    }
+    const elapsedRaw = monthsBetween(tab.startYM, nowYM);
+    const notStarted = elapsedRaw < 0;
+    const elapsed = Math.max(0, Math.min(elapsedRaw, sim.payoffMonth));
+    const paidOff = elapsedRaw >= sim.payoffMonth;
+    const entry = getMonthEntry(sim.history, elapsed);
+    let cumInterest = 0, cumPrincipal = 0, cumExtra = 0;
+    for (let m = 1; m <= elapsed; m++) {
+      const h = sim.history[m];
+      cumInterest += h.interest;
+      cumPrincipal += h.principalPaid;
+      cumExtra += h.extraPrincipalPaid;
+    }
+    const payoffDate = addMonths(tab.startYM, sim.payoffMonth);
+    const remainingMonths = Math.max(0, sim.payoffMonth - elapsed);
+    loans.push({ tab, sim, notStarted, elapsed, paidOff, entry, cumInterest, cumPrincipal, cumExtra, payoffDate, remainingMonths });
+  });
+
+  if (loans.length === 0) {
     return (
       <div style={S.card}>
         <SectionLabel icon={Home} label="現在の状況" />
-        <p style={S.hint}>「{tab.name}」の借入額・返済期間の入力を確認してください。</p>
+        <p style={S.hint}>選択中のタブ「{invalidNames.join("」「")}」の借入額・返済期間の入力を確認してください。</p>
       </div>
     );
   }
 
-  const nowYM = currentYM();
-  const elapsedRaw = monthsBetween(tab.startYM, nowYM);
-  const notStarted = elapsedRaw < 0;
-  const elapsed = Math.max(0, Math.min(elapsedRaw, sim.payoffMonth));
-  const paidOff = elapsedRaw >= sim.payoffMonth;
-  const entry = getMonthEntry(sim.history, elapsed);
-
-  let cumInterest = 0, cumPrincipal = 0, cumExtra = 0;
-  for (let m = 1; m <= elapsed; m++) {
-    const h = sim.history[m];
-    cumInterest += h.interest;
-    cumPrincipal += h.principalPaid;
-    cumExtra += h.extraPrincipalPaid;
-  }
-
-  const payoffDate = addMonths(tab.startYM, sim.payoffMonth);
-  const remainingMonths = Math.max(0, sim.payoffMonth - elapsed);
+  const single = loans.length === 1;
+  const totalBalance = loans.reduce((s, l) => s + l.entry.balance, 0);
+  const totalPrincipalYen = loans.reduce((s, l) => s + l.sim.principalYen, 0);
+  const totalCumPrincipal = loans.reduce((s, l) => s + l.cumPrincipal, 0);
+  const totalCumInterest = loans.reduce((s, l) => s + l.cumInterest, 0);
+  const totalCumExtra = loans.reduce((s, l) => s + l.cumExtra, 0);
+  const totalMonthlyPayment = loans.reduce((s, l) => s + (l.paidOff || l.notStarted ? 0 : l.entry.payment), 0);
+  const allPaidOff = loans.every((l) => l.paidOff);
+  const lastPayoffMonths = Math.max(0, ...loans.map((l) => monthsBetween(nowYM, addMonthsISO(l.tab.startYM, l.sim.payoffMonth))));
 
   return (
     <div>
       <section style={S.card}>
-        <SectionLabel icon={Flag} label={`「${tab.name}」を実際の借入として表示中`} />
+        <SectionLabel
+          icon={Flag}
+          label={
+            single
+              ? `「${loans[0].tab.name}」を実際の借入として表示中`
+              : `${loans.length}件の借入を合算して表示中（${loans.map((l) => l.tab.name).join("・")}）`
+          }
+        />
         <p style={S.hint}>
-          {notStarted
-            ? "借入開始日がまだ先のため、開始前の状態（借入額そのまま）を表示しています。"
-            : paidOff
-            ? `${payoffDate} 頃に完済済みの試算です。`
-            : `${nowYM.replace("-", "年")}月時点（借入から${Math.floor(elapsed / 12)}年${elapsed % 12}ヶ月）の状況です。`}
+          {single
+            ? loans[0].notStarted
+              ? "借入開始日がまだ先のため、開始前の状態（借入額そのまま）を表示しています。"
+              : loans[0].paidOff
+              ? `${loans[0].payoffDate} 頃に完済済みの試算です。`
+              : `${nowYM.replace("-", "年")}月時点（借入から${Math.floor(loans[0].elapsed / 12)}年${loans[0].elapsed % 12}ヶ月）の状況です。`
+            : `${nowYM.replace("-", "年")}月時点の、選択中のすべての借入を合算した状況です。`}
         </p>
+        {invalidNames.length > 0 && (
+          <p style={S.hint}>※「{invalidNames.join("」「")}」は入力が未完了のため、集計に含めていません。</p>
+        )}
       </section>
 
+      {!single && (
+        <section style={{ ...S.resultsCard, marginTop: 0 }}>
+          <SectionLabel icon={Landmark} label="合計の残高" />
+          <div style={S.statGrid}>
+            <StatCard label="合計残高" value={`${man(totalBalance)} 万円`} tone="neutral" />
+            <StatCard label="全て完済まで" value={allPaidOff ? "完済済み" : `${Math.floor(lastPayoffMonths / 12)}年${lastPayoffMonths % 12}ヶ月`} tone="good" />
+          </div>
+          <ProgressBar
+            label="元金の返済（残高ベース・合計）"
+            percent={((totalPrincipalYen - totalBalance) / totalPrincipalYen) * 100}
+            rightLabel={`${man(totalPrincipalYen - totalBalance)} / ${man(totalPrincipalYen)} 万円`}
+          />
+          <div style={S.summaryTable}>
+            <SummaryRow label="借入額（合計）" value={`${man(totalPrincipalYen)} 万円`} />
+            <SummaryRow label="今月の返済額（合計）" value={`${Math.round(totalMonthlyPayment).toLocaleString("ja-JP")} 円`} />
+            <SummaryRow label="これまでに支払った元金（累計・合計）" value={`${man(totalCumPrincipal)} 万円`} />
+            {totalCumExtra > 0 && <SummaryRow label="　うち繰上げ返済分" value={`${man(totalCumExtra)} 万円`} />}
+            <SummaryRow label="これまでに支払った利息（累計・合計）" value={`${man(totalCumInterest)} 万円`} last />
+          </div>
+        </section>
+      )}
+
+      {loans.map((l) => (
+        <div key={l.tab.id}>
+          {!single && (
+            <div style={{ marginTop: 20, marginBottom: 4 }}>
+              <SectionLabel icon={Flag} label={`「${l.tab.name}」の内訳`} />
+            </div>
+          )}
+          <LoanDetailSection l={l} nowYM={nowYM} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function LoanDetailSection({ l }) {
+  const { tab, sim, paidOff, elapsed, entry, cumInterest, cumPrincipal, cumExtra, payoffDate, remainingMonths } = l;
+  return (
+    <>
       <section style={{ ...S.resultsCard, marginTop: 0 }}>
         <SectionLabel icon={Landmark} label="現在の残高" />
         <div style={S.statGrid}>
@@ -1037,7 +1114,7 @@ function DashboardPage({ tab, onGoToSimulator }) {
           </span>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -1062,26 +1139,65 @@ function MonthlyBreakdownCard({ entry }) {
 }
 
 // ---------- 毎月の返済予定金額 (amortization schedule) ----------
-function SchedulePage({ tab, onGoToSimulator }) {
+function SchedulePage({ tabs, onGoToSimulator }) {
   const [windowSize, setWindowSize] = useState(24);
 
-  if (!tab) return <NoActualTabNotice onGoToSimulator={onGoToSimulator} />;
+  if (!tabs || tabs.length === 0) return <NoActualTabNotice onGoToSimulator={onGoToSimulator} />;
 
-  const sim = runActualSimulation(tab);
-  if (!sim) {
+  const nowYM = currentYM();
+  const invalidNames = [];
+  const loans = [];
+  tabs.forEach((tab) => {
+    const sim = runActualSimulation(tab);
+    if (!sim) {
+      invalidNames.push(tab.name);
+      return;
+    }
+    loans.push({ tab, sim });
+  });
+
+  if (loans.length === 0) {
     return (
       <div style={S.card}>
         <SectionLabel icon={Table} label="返済予定表" />
-        <p style={S.hint}>「{tab.name}」の借入額・返済期間の入力を確認してください。</p>
+        <p style={S.hint}>選択中のタブ「{invalidNames.join("」「")}」の借入額・返済期間の入力を確認してください。</p>
       </div>
     );
   }
 
-  const nowYM = currentYM();
+  const single = loans.length === 1;
+  const showAll = windowSize === Infinity;
+
+  return (
+    <div>
+      <section style={S.card}>
+        <SectionLabel
+          icon={Flag}
+          label={single ? `「${loans[0].tab.name}」の返済予定表` : `${loans.length}件の返済予定表（${loans.map((l) => l.tab.name).join("・")}）`}
+        />
+        <p style={S.hint}>今月（{nowYM.replace("-", "年")}月）以降の毎月の返済予定です。返済額は「元金＋利息」の内訳で表示しています。</p>
+        {invalidNames.length > 0 && (
+          <p style={S.hint}>※「{invalidNames.join("」「")}」は入力が未完了のため、表示していません。</p>
+        )}
+        <div style={S.scheduleFilterRow}>
+          <IconBtn label="今後12ヶ月" variant={windowSize === 12 ? "solid" : "ghost"} small onClick={() => setWindowSize(12)} />
+          <IconBtn label="今後24ヶ月" variant={windowSize === 24 ? "solid" : "ghost"} small onClick={() => setWindowSize(24)} />
+          <IconBtn label="今後60ヶ月" variant={windowSize === 60 ? "solid" : "ghost"} small onClick={() => setWindowSize(60)} />
+          <IconBtn label="完済まで全部" variant={showAll ? "solid" : "ghost"} small onClick={() => setWindowSize(Infinity)} />
+        </div>
+      </section>
+
+      {loans.map((l) => (
+        <ScheduleTableSection key={l.tab.id} tab={l.tab} sim={l.sim} nowYM={nowYM} windowSize={windowSize} showAll={showAll} showTitle={!single} />
+      ))}
+    </div>
+  );
+}
+
+function ScheduleTableSection({ tab, sim, nowYM, windowSize, showAll, showTitle }) {
   const elapsedRaw = monthsBetween(tab.startYM, nowYM);
   const startIdx = Math.max(1, Math.min(elapsedRaw, sim.payoffMonth));
   const lastIdx = sim.history.length - 1;
-  const showAll = windowSize === Infinity;
   const endIdx = showAll ? lastIdx : Math.min(lastIdx, startIdx + windowSize - 1);
 
   const rows = [];
@@ -1092,54 +1208,46 @@ function SchedulePage({ tab, onGoToSimulator }) {
   const yen = (n) => Math.round(n).toLocaleString("ja-JP");
 
   return (
-    <div>
-      <section style={S.card}>
-        <SectionLabel icon={Flag} label={`「${tab.name}」の返済予定表`} />
-        <p style={S.hint}>今月（{nowYM.replace("-", "年")}月）以降の毎月の返済予定です。返済額は「元金＋利息」の内訳で表示しています。</p>
-        <div style={S.scheduleFilterRow}>
-          <IconBtn label="今後12ヶ月" variant={windowSize === 12 ? "solid" : "ghost"} small onClick={() => setWindowSize(12)} />
-          <IconBtn label="今後24ヶ月" variant={windowSize === 24 ? "solid" : "ghost"} small onClick={() => setWindowSize(24)} />
-          <IconBtn label="今後60ヶ月" variant={windowSize === 60 ? "solid" : "ghost"} small onClick={() => setWindowSize(60)} />
-          <IconBtn label="完済まで全部" variant={showAll ? "solid" : "ghost"} small onClick={() => setWindowSize(Infinity)} />
+    <section style={S.card}>
+      {showTitle && (
+        <div style={{ marginBottom: 10 }}>
+          <SectionLabel icon={Flag} label={`「${tab.name}」の内訳`} />
         </div>
-      </section>
-
-      <section style={S.card}>
-        <div style={S.scheduleTableWrap}>
-          <table style={S.scheduleTable}>
-            <thead>
-              <tr>
-                <th style={S.scheduleTh}>年月</th>
-                <th style={S.scheduleTh}>返済額</th>
-                <th style={S.scheduleTh}>元金</th>
-                <th style={S.scheduleTh}>利息</th>
-                <th style={S.scheduleTh}>残高</th>
+      )}
+      <div style={S.scheduleTableWrap}>
+        <table style={S.scheduleTable}>
+          <thead>
+            <tr>
+              <th style={S.scheduleTh}>年月</th>
+              <th style={S.scheduleTh}>返済額</th>
+              <th style={S.scheduleTh}>元金</th>
+              <th style={S.scheduleTh}>利息</th>
+              <th style={S.scheduleTh}>残高</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((h) => (
+              <tr key={h.m}>
+                <td style={S.scheduleTd}>{addMonths(tab.startYM, h.m)}</td>
+                <td style={S.scheduleTd}>{yen(h.payment)}</td>
+                <td style={S.scheduleTd}>
+                  {yen(h.principalPaid)}
+                  {h.extraPrincipalPaid > 0 && <span style={S.scheduleExtraNote}>（繰{yen(h.extraPrincipalPaid)}）</span>}
+                </td>
+                <td style={S.scheduleTd}>{yen(h.interest)}</td>
+                <td style={S.scheduleTd}>{man(h.balance)}万</td>
               </tr>
-            </thead>
-            <tbody>
-              {rows.map((h) => (
-                <tr key={h.m}>
-                  <td style={S.scheduleTd}>{addMonths(tab.startYM, h.m)}</td>
-                  <td style={S.scheduleTd}>{yen(h.payment)}</td>
-                  <td style={S.scheduleTd}>
-                    {yen(h.principalPaid)}
-                    {h.extraPrincipalPaid > 0 && <span style={S.scheduleExtraNote}>（繰{yen(h.extraPrincipalPaid)}）</span>}
-                  </td>
-                  <td style={S.scheduleTd}>{yen(h.interest)}</td>
-                  <td style={S.scheduleTd}>{man(h.balance)}万</td>
-                </tr>
-              ))}
-              {rows.length === 0 && (
-                <tr><td style={S.scheduleTd} colSpan={5}>表示できる返済予定がありません（すでに完済済みの可能性があります）。</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-        {!showAll && endIdx < lastIdx && (
-          <p style={S.hint}>完済（{addMonths(tab.startYM, sim.payoffMonth)}）まで、あと{lastIdx - endIdx}ヶ月分あります。「完済まで全部」で全期間を表示できます。</p>
-        )}
-      </section>
-    </div>
+            ))}
+            {rows.length === 0 && (
+              <tr><td style={S.scheduleTd} colSpan={5}>表示できる返済予定がありません（すでに完済済みの可能性があります）。</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {!showAll && endIdx < lastIdx && (
+        <p style={S.hint}>完済（{addMonths(tab.startYM, sim.payoffMonth)}）まで、あと{lastIdx - endIdx}ヶ月分あります。「完済まで全部」で全期間を表示できます。</p>
+      )}
+    </section>
   );
 }
 
