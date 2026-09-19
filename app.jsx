@@ -1261,10 +1261,90 @@ function SchedulePage({ tabs, onGoToSimulator }) {
         </div>
       </section>
 
+      {!single && (
+        <CombinedScheduleTableSection loans={loans} nowYM={nowYM} windowSize={windowSize} showAll={showAll} />
+      )}
+
       {loans.map((l) => (
         <ScheduleTableSection key={l.tab.id} tab={l.tab} sim={l.sim} nowYM={nowYM} windowSize={windowSize} showAll={showAll} showTitle={!single} />
       ))}
     </div>
+  );
+}
+
+// Merge multiple loans' monthly schedules into one combined schedule, keyed by
+// calendar year-month. Only loans that still have a scheduled row for a given
+// month (i.e. not yet paid off) contribute to that month's totals.
+function buildCombinedScheduleRows(loans, nowYM, windowSize, showAll) {
+  const map = new Map();
+  loans.forEach(({ tab, sim }) => {
+    const elapsedRaw = monthsBetween(tab.startYM, nowYM);
+    const startIdx = Math.max(1, Math.min(elapsedRaw, sim.payoffMonth));
+    const lastIdx = sim.history.length - 1;
+    const endIdx = showAll ? lastIdx : Math.min(lastIdx, startIdx + windowSize - 1);
+    for (let m = startIdx; m <= endIdx; m++) {
+      const h = sim.history[m];
+      const ym = addMonths(tab.startYM, h.m);
+      const entry = map.get(ym) || { ym, payment: 0, principalPaid: 0, extraPrincipalPaid: 0, interest: 0, balance: 0 };
+      entry.payment += h.payment;
+      entry.principalPaid += h.principalPaid;
+      entry.extraPrincipalPaid += h.extraPrincipalPaid;
+      entry.interest += h.interest;
+      entry.balance += h.balance;
+      map.set(ym, entry);
+    }
+  });
+  return Array.from(map.values()).sort((a, b) => (a.ym < b.ym ? -1 : a.ym > b.ym ? 1 : 0));
+}
+
+function CombinedScheduleTableSection({ loans, nowYM, windowSize, showAll }) {
+  const rows = buildCombinedScheduleRows(loans, nowYM, windowSize, showAll);
+  const yen = (n) => Math.round(n).toLocaleString("ja-JP");
+
+  // figure out how far this combined view is from full payoff, for the trailing hint
+  const lastCombinedYM = rows.length > 0 ? rows[rows.length - 1].ym : null;
+  const fullyDone = loans.every(({ tab, sim }) => addMonths(tab.startYM, sim.payoffMonth) <= (lastCombinedYM || nowYM));
+
+  return (
+    <section style={S.card}>
+      <div style={{ marginBottom: 10 }}>
+        <SectionLabel icon={Flag} label={`合算後の返済予定表（${loans.map((l) => l.tab.name).join("・")}）`} />
+      </div>
+      <p style={S.hint}>選択中の{loans.length}件を月ごとに合算した金額です。いずれかが完済した月以降は、残っているものだけを合算します。</p>
+      <div style={S.scheduleTableWrap}>
+        <table style={S.scheduleTable}>
+          <thead>
+            <tr>
+              <th style={S.scheduleTh}>年月</th>
+              <th style={S.scheduleTh}>返済額</th>
+              <th style={S.scheduleTh}>元金</th>
+              <th style={S.scheduleTh}>利息</th>
+              <th style={S.scheduleTh}>残高</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.ym}>
+                <td style={S.scheduleTd}>{r.ym}</td>
+                <td style={S.scheduleTd}>{yen(r.payment)}</td>
+                <td style={S.scheduleTd}>
+                  {yen(r.principalPaid)}
+                  {r.extraPrincipalPaid > 0 && <span style={S.scheduleExtraNote}>（繰{yen(r.extraPrincipalPaid)}）</span>}
+                </td>
+                <td style={S.scheduleTd}>{yen(r.interest)}</td>
+                <td style={S.scheduleTd}>{man(r.balance)}万</td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr><td style={S.scheduleTd} colSpan={5}>表示できる返済予定がありません（すでに完済済みの可能性があります）。</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {!showAll && !fullyDone && (
+        <p style={S.hint}>「完済まで全部」を選ぶと、すべての借入が完済するまでの合算予定を表示できます。</p>
+      )}
+    </section>
   );
 }
 
