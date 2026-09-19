@@ -143,6 +143,25 @@ function simulate(principal, termMonths, rateChanges, extraRepayments, options =
 const man = (n) => Math.round(n / 10000).toLocaleString("ja-JP");
 const nextId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 
+// ---------- rate sensitivity analysis ----------
+// Re-runs the same scenario (same principal/term/extra repayments) while shifting
+// every entry in the rate history by a fixed number of percentage points, so the
+// impact of "if rates had been X% higher/lower" on total interest becomes visible.
+function computeRateSensitivity(principalYen, termMonths, rcFinal, exFinal, simOptions) {
+  const deltas = [-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2];
+  const seen = new Set();
+  const out = [];
+  deltas.forEach((delta) => {
+    const shifted = rcFinal.map((r) => ({ m: r.m, rate: Math.max(0, Math.round((r.rate + delta) * 100) / 100) }));
+    const key = shifted.map((r) => r.rate).join(",");
+    if (delta !== 0 && seen.has(key)) return; // skip duplicate scenarios clamped to 0%
+    seen.add(key);
+    const sim = simulate(principalYen, termMonths, shifted, exFinal, simOptions);
+    out.push({ delta, rate: shifted[0].rate, totalInterest: sim.totalInterest, didNotPayOff: sim.didNotPayOff });
+  });
+  return out;
+}
+
 // ---------- prepayment vs. investing comparison ----------
 function fvMonthly(amount, months, annualReturnPct) {
   const r = annualReturnPct / 100 / 12;
@@ -447,6 +466,61 @@ function LedgerChart({ data }) {
       ))}
       <polyline points={ptsHypo} fill="none" stroke="#A6ADA6" strokeWidth="2" strokeDasharray="6 4" strokeLinecap="round" />
       <polyline points={ptsActual} fill="none" stroke={T.accent} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// ---------- rate sensitivity bar chart ----------
+function RateSensitivityChart({ data }) {
+  const width = 600, height = 250;
+  const pad = { top: 24, right: 14, bottom: 44, left: 52 };
+  const w = width - pad.left - pad.right;
+  const h = height - pad.top - pad.bottom;
+  const vals = data.map((d) => Math.round(d.totalInterest / 10000));
+  const maxVal = Math.max(1, ...vals);
+  const n = data.length;
+  const slot = w / n;
+  const barW = Math.min(38, slot * 0.62);
+  const yAt = (v) => pad.top + h - (v / maxVal) * h;
+  const gridCount = 4;
+  const grid = [];
+  for (let g = 0; g <= gridCount; g++) grid.push(Math.round((maxVal * g) / gridCount));
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto", display: "block" }}>
+      {grid.map((val, idx) => {
+        const y = yAt(val);
+        return (
+          <g key={idx}>
+            <line x1={pad.left} x2={width - pad.right} y1={y} y2={y} stroke={T.divider} strokeWidth="1" />
+            <text x={pad.left - 6} y={y + 3} fontSize="10" fill={T.muted} textAnchor="end">{val.toLocaleString()}万</text>
+          </g>
+        );
+      })}
+      {data.map((d, i) => {
+        const valMan = vals[i];
+        const cx = pad.left + slot * i + slot / 2;
+        const barTop = yAt(valMan);
+        const barH = pad.top + h - barTop;
+        const isCurrent = d.delta === 0;
+        return (
+          <g key={i}>
+            <rect x={cx - barW / 2} y={barTop} width={barW} height={Math.max(0, barH)} rx="3"
+              fill={isCurrent ? T.accent : "#C7CFC0"} />
+            <text x={cx} y={barTop - 6} fontSize="10" fontWeight={isCurrent ? "700" : "600"}
+              fill={isCurrent ? T.accentDark : T.muted} textAnchor="middle">
+              {valMan.toLocaleString()}{d.didNotPayOff ? "+" : ""}
+            </text>
+            <text x={cx} y={height - 24} fontSize="10.5" fontWeight={isCurrent ? "700" : "500"}
+              fill={isCurrent ? T.ink : T.muted} textAnchor="middle">
+              {d.rate.toFixed(2)}%
+            </text>
+            <text x={cx} y={height - 10} fontSize="9.5" fill={isCurrent ? T.accent : T.muted} textAnchor="middle">
+              {isCurrent ? "現在" : d.delta > 0 ? `+${d.delta}` : `${d.delta}`}
+            </text>
+          </g>
+        );
+      })}
     </svg>
   );
 }
@@ -1325,6 +1399,8 @@ function SimulatorTab({ tab, onChange }) {
       chartData.push({ m: maxLen, date: addMonths(startYM, maxLen), actual: Math.round(lastA / 10000), hypo: Math.round(lastH / 10000) });
     }
 
+    const rateSensitivity = computeRateSensitivity(principalYen, termMonths, rcFinal, exFinal, simOptions);
+
     const investCompare = computeInvestmentComparison({
       hypoHistory: hypo.history,
       exFinal,
@@ -1344,6 +1420,7 @@ function SimulatorTab({ tab, onChange }) {
       hypoPayoffDate: addMonths(startYM, hypo.payoffMonth),
       monthsShortened: hypo.payoffMonth - actual.payoffMonth,
       extraTotal: exFinal.reduce((s, e) => s + e.amount, 0),
+      rateSensitivity,
       investCompare,
       applyFiveYearRule: !!applyFiveYearRule,
       actualUnpaidInterest: actual.unpaidInterestTotal,
@@ -1475,6 +1552,8 @@ function SimulatorTab({ tab, onChange }) {
             <SummaryRow label="完済時期（繰上げ返済なしの場合）" value={result.hypoPayoffDate} last />
           </div>
 
+          <RateSensitivityBlock data={result.rateSensitivity} />
+
           <InvestCompareBlock compare={result.investCompare} rate={investReturnRate} />
 
           <p style={S.note}>
@@ -1517,6 +1596,44 @@ function SummaryRow({ label, value, last }) {
     <div style={last ? { ...S.summaryRow, borderBottom: "none" } : S.summaryRow}>
       <span style={S.summaryLabel}>{label}</span>
       <span style={S.summaryValue}>{value}</span>
+    </div>
+  );
+}
+
+function RateSensitivityBlock({ data }) {
+  if (!data || data.length === 0) return null;
+  const base = data.find((d) => d.delta === 0);
+  const plusOne = data.find((d) => d.delta === 1);
+  const minusOne = data.find((d) => d.delta === -1);
+  const anyDidNotPayOff = data.some((d) => d.didNotPayOff);
+
+  return (
+    <div style={S.investBlock}>
+      <div style={S.sectionLabel}>
+        <span style={S.sectionIcon}><TrendingUp size={15} strokeWidth={2.25} /></span>
+        <span style={S.sectionText}>金利感度分析</span>
+      </div>
+      <p style={S.hint}>
+        借入額・返済期間・繰上げ返済の内容はそのままに、金利の水準だけを現在の設定から一律に上下させた場合、総利息（実際の返済シナリオ）がどう変わるかを試算したものです。将来の金利変動リスクの目安としてご利用ください。
+      </p>
+
+      <div style={S.chartWrap}>
+        <RateSensitivityChart data={data} />
+      </div>
+
+      {base && plusOne && (
+        <p style={S.verdict}>
+          金利が現在より <strong>1％上がる</strong>と、総利息は約 <strong>{man(plusOne.totalInterest - base.totalInterest)} 万円</strong> 増える見込みです（{man(base.totalInterest)}万円 → {man(plusOne.totalInterest)}万円）。
+          {minusOne && (
+            <> 逆に <strong>1％下がる</strong>と、約 <strong>{man(base.totalInterest - minusOne.totalInterest)} 万円</strong> 少なくなる見込みです。</>
+          )}
+        </p>
+      )}
+
+      <p style={S.note}>
+        ※ 金利の変動履歴に複数の変更点がある場合、そのすべてに同じ幅（±0.5〜2％）を加減して試算しています。5年ルール・125%ルールをONにしている場合は、その効果もあわせて再計算されます。
+        {anyDidNotPayOff && " 一部のシナリオでは試算期間内に完済に至らなかったため、その棒グラフの値は実際より小さく表示されている可能性があります（グラフ上部に「+」を表示）。"}
+      </p>
     </div>
   );
 }
