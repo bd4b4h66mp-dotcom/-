@@ -2,7 +2,7 @@
 // Claude の window.storage / lucide-react には依存せず、
 // localStorage と URL共有コードだけで動く単体ページとして動作します。
 // React / ReactDOM はグローバル（CDNのUMDビルド）を利用します。
-const { useState, useEffect } = React;
+const { useState, useEffect, useRef } = React;
 
 // ---------- date helpers (YYYY-MM strings) ----------
 function parseYM(ym) {
@@ -269,6 +269,75 @@ function saveTabsToStorage(state) {
   } catch (e) {
     return false;
   }
+}
+
+// ---------- save history (checkpoints this browser can roll back to) ----------
+// Autosave only ever keeps the *latest* state under STORAGE_KEY, so a mistaken edit,
+// a "reset", or an unexpected auto-save can silently overwrite good data with no way
+// back. This keeps a capped list of past snapshots (with timestamps) that the person
+// can browse and restore from, independent of the live autosave.
+const HISTORY_KEY = "mortgage-prepayment-history-v1";
+const MAX_HISTORY = 30;
+function loadHistory() {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return [];
+    const raw = window.localStorage.getItem(HISTORY_KEY);
+    if (!raw) return [];
+    const data = JSON.parse(raw);
+    return Array.isArray(data) ? data : [];
+  } catch (e) {
+    return [];
+  }
+}
+function pushHistorySnapshot(state, reason) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return loadHistory();
+    const list = loadHistory();
+    const latest = list[0];
+    const serialized = JSON.stringify({ tabs: state.tabs, activeTabId: state.activeTabId });
+    // don't add a duplicate checkpoint if nothing has actually changed since the last one
+    if (latest && JSON.stringify({ tabs: latest.tabs, activeTabId: latest.activeTabId }) === serialized) {
+      return list;
+    }
+    const entry = { id: nextId(), savedAt: new Date().toISOString(), reason: reason || "自動", tabs: state.tabs, activeTabId: state.activeTabId };
+    const next = [entry, ...list].slice(0, MAX_HISTORY);
+    window.localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+    return next;
+  } catch (e) {
+    return loadHistory();
+  }
+}
+function deleteHistoryEntry(id) {
+  try {
+    const next = loadHistory().filter((e) => e.id !== id);
+    window.localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+    return next;
+  } catch (e) {
+    return loadHistory();
+  }
+}
+function clearHistory() {
+  try {
+    window.localStorage.removeItem(HISTORY_KEY);
+  } catch (e) {
+    // ignore
+  }
+  return [];
+}
+function formatHistoryTime(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    return iso;
+  }
+}
+function summarizeSnapshot(entry) {
+  const list = Array.isArray(entry.tabs) ? entry.tabs : [];
+  if (list.length === 0) return "（データなし）";
+  const names = list.map((t) => t.name).filter(Boolean);
+  const head = names.slice(0, 2).join("、");
+  return list.length > 2 ? `${head} 他${list.length - 2}件` : head || `タブ${list.length}件`;
 }
 
 // ---------- share code: a self-contained link, no backend required ----------
@@ -549,6 +618,8 @@ const TriangleAlert = (p) => <IconBase {...p}><path d="M12 3l10 18H2L12 3z" /><l
 const Flag = (p) => <IconBase {...p}><line x1="5" y1="21" x2="5" y2="4" /><path d="M5 4.5c2-1.2 4-1.2 6 0s4 1.2 6 0v9c-2 1.2-4 1.2-6 0s-4-1.2-6 0z" /></IconBase>;
 const Home = (p) => <IconBase {...p}><path d="M4 11l8-7 8 7" /><path d="M6 10v10h12V10" /></IconBase>;
 const Table = (p) => <IconBase {...p}><rect x="3.5" y="4.5" width="17" height="15" rx="1.5" /><line x1="3.5" y1="9.5" x2="20.5" y2="9.5" /><line x1="3.5" y1="14.5" x2="20.5" y2="14.5" /><line x1="10.5" y1="4.5" x2="10.5" y2="19.5" /></IconBase>;
+const History = (p) => <IconBase {...p}><path d="M3.5 12a8.5 8.5 0 1 0 2.8-6.3" /><polyline points="3 4 3.5 9 8.5 8.3" /><polyline points="12 8 12 12.5 15.5 14.5" /></IconBase>;
+const Trash2 = (p) => <IconBase {...p}><polyline points="4 7 6 7 20 7" /><path d="M9 7V4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V7" /><path d="M6.5 7l1 12.5A1.5 1.5 0 0 0 9 21h6a1.5 1.5 0 0 0 1.5-1.5L17.5 7" /><line x1="10.2" y1="11" x2="10.2" y2="17" /><line x1="13.8" y1="11" x2="13.8" y2="17" /></IconBase>;
 
 // ---------- small reusable pieces ----------
 function IconBtn({ icon: Icon, label, onClick, variant = "ghost", disabled, small, title }) {
@@ -708,6 +779,9 @@ function App() {
   const [importCode, setImportCode] = useState("");
   const [incomingShared, setIncomingShared] = useState(null);
   const [lastShareUrl, setLastShareUrl] = useState("");
+  const [history, setHistory] = useState([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const lastSnapshotAtRef = useRef(0);
 
   // load previously saved tabs from this browser on mount
   useEffect(() => {
@@ -719,6 +793,7 @@ function App() {
     } else {
       setActiveTabId((id) => id || tabs[0].id);
     }
+    setHistory(loadHistory());
     setLoaded(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -746,8 +821,28 @@ function App() {
           setSaveStatus(saveTabsToStorage({ tabs, activeTabId }) ? "saved" : "error");
         }, 800);
       }
+      // in addition to the live autosave above, keep a capped history of checkpoints
+      // (at most one every 5 minutes while actively editing) so a bad overwrite can be undone
+      const now = Date.now();
+      if (now - lastSnapshotAtRef.current > 5 * 60 * 1000) {
+        lastSnapshotAtRef.current = now;
+        setHistory(pushHistorySnapshot({ tabs, activeTabId }, "自動"));
+      }
     }, 500);
     return () => clearTimeout(t);
+  }, [loaded, tabs, activeTabId, storageSupported]);
+
+  // also record a checkpoint right before the tab is closed/backgrounded, as a last safety net
+  useEffect(() => {
+    if (!loaded || storageSupported === false) return;
+    const handler = () => {
+      if (document.visibilityState === "hidden") {
+        lastSnapshotAtRef.current = Date.now();
+        pushHistorySnapshot({ tabs, activeTabId }, "自動（画面を離れる直前）");
+      }
+    };
+    document.addEventListener("visibilitychange", handler);
+    return () => document.removeEventListener("visibilitychange", handler);
   }, [loaded, tabs, activeTabId, storageSupported]);
 
   useEffect(() => {
@@ -796,6 +891,7 @@ function App() {
   function deleteTab(id) {
     if (tabs.length <= 1) return;
     if (!window.confirm("このタブを削除しますか？入力内容は失われます。")) return;
+    setHistory(pushHistorySnapshot({ tabs, activeTabId }, "タブ削除の直前")); // safety checkpoint
     const next = tabs.filter((t) => t.id !== id);
     setTabs(next);
     if (activeTabId === id) setActiveTabId(next[0].id);
@@ -807,6 +903,7 @@ function App() {
 
   function resetActiveTab() {
     if (!window.confirm("このタブの入力内容をすべて削除して初期状態に戻しますか？")) return;
+    setHistory(pushHistorySnapshot({ tabs, activeTabId }, "初期化の直前")); // safety checkpoint
     updateActiveTab((t) => {
       const fresh = defaultTabData(t.name);
       return {
@@ -832,6 +929,24 @@ function App() {
         ? "共有用リンクをコピーしました。メールやチャットなどで相手に送ってください。"
         : "自動コピーできませんでした。下に表示されたリンクを手動でコピーしてください。"
     );
+  }
+
+  function restoreHistoryEntry(entry) {
+    if (!window.confirm(`${formatHistoryTime(entry.savedAt)}時点の状態に戻しますか？\n現在の内容は「復元前の状態」として履歴に保存されてから復元されます。`)) return;
+    setHistory(pushHistorySnapshot({ tabs, activeTabId }, "復元前の状態")); // don't lose current state either
+    setTabs(entry.tabs);
+    setActiveTabId(entry.tabs.some((t) => t.id === entry.activeTabId) ? entry.activeTabId : entry.tabs[0].id);
+    setHistoryOpen(false);
+    setToast(`${formatHistoryTime(entry.savedAt)}時点の状態に復元しました。`);
+  }
+
+  function removeHistoryEntry(id) {
+    setHistory(deleteHistoryEntry(id));
+  }
+
+  function clearAllHistory() {
+    if (!window.confirm("保存履歴をすべて削除しますか？この操作は取り消せません。")) return;
+    setHistory(clearHistory());
   }
 
   function handleImportCode() {
@@ -919,6 +1034,8 @@ function App() {
               title="「現在の状況」「返済予定表」ページに表示する借入として、このタブを使います（複数選択できます）"
             />
             <IconBtn icon={RotateCcw} label="初期化" variant="ghost" onClick={resetActiveTab} />
+            <IconBtn icon={History} label={`履歴${history.length > 0 ? `（${history.length}）` : ""}`} variant={historyOpen ? "solid" : "ghost"}
+              onClick={() => setHistoryOpen((v) => !v)} title="過去の保存内容を確認して復元します" />
             <span style={S.saveStatusText}>
               {storageSupported === false
                 ? "自動保存はこのブラウザでは利用できません（このセッション中のみ有効）"
@@ -931,6 +1048,35 @@ function App() {
                 : ""}
             </span>
           </div>
+          {historyOpen && (
+            <div style={S.importBox}>
+              <p style={S.hint}>
+                この端末に自動保存された過去のチェックポイントです。編集中は約5分ごと、またタブ削除・初期化・復元の直前にも記録されます（最大{MAX_HISTORY}件）。すべてのタブの状態がまとめて保存/復元されます。
+              </p>
+              {history.length === 0 ? (
+                <p style={{ ...S.hint, marginTop: 8 }}>まだ履歴がありません。しばらく編集を続けると自動的に記録されます。</p>
+              ) : (
+                <div style={S.historyList}>
+                  {history.map((entry) => (
+                    <div key={entry.id} style={S.historyRow}>
+                      <div style={S.historyInfo}>
+                        <span style={S.historyTime}>{formatHistoryTime(entry.savedAt)}</span>
+                        <span style={S.historyMeta}>{summarizeSnapshot(entry)} ・ {entry.reason}</span>
+                      </div>
+                      <div style={S.row}>
+                        <IconBtn icon={RotateCcw} label="この時点に戻す" variant="solid" small onClick={() => restoreHistoryEntry(entry)} />
+                        <IconOnlyBtn icon={Trash2} tone="danger" title="この履歴を削除" onClick={() => removeHistoryEntry(entry.id)} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {history.length > 0 && (
+                <button style={S.historyClearBtn} onClick={clearAllHistory}>履歴をすべて削除</button>
+              )}
+            </div>
+          )}
+
           {lastShareUrl && (
             <p style={S.shareCodeLine}>
               共有用リンク：
@@ -1261,90 +1407,10 @@ function SchedulePage({ tabs, onGoToSimulator }) {
         </div>
       </section>
 
-      {!single && (
-        <CombinedScheduleTableSection loans={loans} nowYM={nowYM} windowSize={windowSize} showAll={showAll} />
-      )}
-
       {loans.map((l) => (
         <ScheduleTableSection key={l.tab.id} tab={l.tab} sim={l.sim} nowYM={nowYM} windowSize={windowSize} showAll={showAll} showTitle={!single} />
       ))}
     </div>
-  );
-}
-
-// Merge multiple loans' monthly schedules into one combined schedule, keyed by
-// calendar year-month. Only loans that still have a scheduled row for a given
-// month (i.e. not yet paid off) contribute to that month's totals.
-function buildCombinedScheduleRows(loans, nowYM, windowSize, showAll) {
-  const map = new Map();
-  loans.forEach(({ tab, sim }) => {
-    const elapsedRaw = monthsBetween(tab.startYM, nowYM);
-    const startIdx = Math.max(1, Math.min(elapsedRaw, sim.payoffMonth));
-    const lastIdx = sim.history.length - 1;
-    const endIdx = showAll ? lastIdx : Math.min(lastIdx, startIdx + windowSize - 1);
-    for (let m = startIdx; m <= endIdx; m++) {
-      const h = sim.history[m];
-      const ym = addMonths(tab.startYM, h.m);
-      const entry = map.get(ym) || { ym, payment: 0, principalPaid: 0, extraPrincipalPaid: 0, interest: 0, balance: 0 };
-      entry.payment += h.payment;
-      entry.principalPaid += h.principalPaid;
-      entry.extraPrincipalPaid += h.extraPrincipalPaid;
-      entry.interest += h.interest;
-      entry.balance += h.balance;
-      map.set(ym, entry);
-    }
-  });
-  return Array.from(map.values()).sort((a, b) => (a.ym < b.ym ? -1 : a.ym > b.ym ? 1 : 0));
-}
-
-function CombinedScheduleTableSection({ loans, nowYM, windowSize, showAll }) {
-  const rows = buildCombinedScheduleRows(loans, nowYM, windowSize, showAll);
-  const yen = (n) => Math.round(n).toLocaleString("ja-JP");
-
-  // figure out how far this combined view is from full payoff, for the trailing hint
-  const lastCombinedYM = rows.length > 0 ? rows[rows.length - 1].ym : null;
-  const fullyDone = loans.every(({ tab, sim }) => addMonths(tab.startYM, sim.payoffMonth) <= (lastCombinedYM || nowYM));
-
-  return (
-    <section style={S.card}>
-      <div style={{ marginBottom: 10 }}>
-        <SectionLabel icon={Flag} label={`合算後の返済予定表（${loans.map((l) => l.tab.name).join("・")}）`} />
-      </div>
-      <p style={S.hint}>選択中の{loans.length}件を月ごとに合算した金額です。いずれかが完済した月以降は、残っているものだけを合算します。</p>
-      <div style={S.scheduleTableWrap}>
-        <table style={S.scheduleTable}>
-          <thead>
-            <tr>
-              <th style={S.scheduleTh}>年月</th>
-              <th style={S.scheduleTh}>返済額</th>
-              <th style={S.scheduleTh}>元金</th>
-              <th style={S.scheduleTh}>利息</th>
-              <th style={S.scheduleTh}>残高</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.ym}>
-                <td style={S.scheduleTd}>{r.ym}</td>
-                <td style={S.scheduleTd}>{yen(r.payment)}</td>
-                <td style={S.scheduleTd}>
-                  {yen(r.principalPaid)}
-                  {r.extraPrincipalPaid > 0 && <span style={S.scheduleExtraNote}>（繰{yen(r.extraPrincipalPaid)}）</span>}
-                </td>
-                <td style={S.scheduleTd}>{yen(r.interest)}</td>
-                <td style={S.scheduleTd}>{man(r.balance)}万</td>
-              </tr>
-            ))}
-            {rows.length === 0 && (
-              <tr><td style={S.scheduleTd} colSpan={5}>表示できる返済予定がありません（すでに完済済みの可能性があります）。</td></tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-      {!showAll && !fullyDone && (
-        <p style={S.hint}>「完済まで全部」を選ぶと、すべての借入が完済するまでの合算予定を表示できます。</p>
-      )}
-    </section>
   );
 }
 
@@ -1891,6 +1957,14 @@ const S = {
 
   // ---- import box ----
   importBox: { border: `1px solid ${T.divider}`, borderRadius: 10, padding: 12, marginBottom: 14, background: T.surface },
+
+  // ---- save history panel ----
+  historyList: { display: "flex", flexDirection: "column", gap: 8, marginTop: 8, maxHeight: 320, overflowY: "auto" },
+  historyRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, border: `1px solid ${T.divider}`, borderRadius: 8, padding: "8px 10px", background: T.page, flexWrap: "wrap" },
+  historyInfo: { display: "flex", flexDirection: "column", gap: 2, minWidth: 0 },
+  historyTime: { fontSize: 13, fontWeight: 700, color: T.ink },
+  historyMeta: { fontSize: 11, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 },
+  historyClearBtn: { fontSize: 11.5, color: T.muted, background: "none", border: "none", textDecoration: "underline", cursor: "pointer", padding: 0, marginTop: 10 },
 
   // ---- toast ----
   toast: { position: "fixed", left: "50%", bottom: 20, transform: "translateX(-50%)", background: T.ink, color: "#FFFFFF", fontSize: 12.5, padding: "12px 16px", borderRadius: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.25)", zIndex: 50, maxWidth: "92%", textAlign: "center", lineHeight: 1.6 },
